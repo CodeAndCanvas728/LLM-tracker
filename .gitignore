@@ -28,8 +28,6 @@ DerivedData/
 *.xcworkspace/
 !default.xcworkspace/
 *.xcframework
-LLM_Tracker_icon.png
 LLM_Tracker_icon.psd
-LLM_Tracker_logo.png
 LLM_Tracker_logo.psd
 GEMINI.md
