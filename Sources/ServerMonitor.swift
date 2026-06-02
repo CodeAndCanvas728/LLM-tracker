@@ -11,7 +11,8 @@ class ServerMonitor: ObservableObject {
     let serverKeywords = [
         "ollama", "vllm", "mlx_lm", "mlx-lm", "omlx", 
         "mlx-openai-server", "mlx-omni-server", 
-        "vmlx", "vllm-mlx", "mlx-audio", "mlx-vlm", "mflux"
+        "vmlx", "vllm-mlx", "mlx-audio", "mlx-vlm", "mflux",
+        "swift-mlx", "mlx-swift", "mlx-swift-lm", "swiftlm"
     ]
     
     init() {
@@ -63,10 +64,18 @@ class ServerMonitor: ObservableObject {
     private func fetchInstances() async -> [ServerInstance] {
         var foundInstances: [ServerInstance] = []
         
+        // 1. Fetch all running processes using ps
         let processOutput = runCommand("ps", args: ["-eo", "pid,ppid,command", "-ww"])
-        let lines = processOutput.components(separatedBy: .newlines)
+        let psLines = processOutput.components(separatedBy: .newlines)
         
-        for line in lines {
+        struct ProcessInfo {
+            let pid: Int32
+            let ppid: Int32
+            let command: String
+        }
+        var processMap: [Int32: ProcessInfo] = [:]
+        
+        for line in psLines {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty || trimmed.contains("PID") { continue }
             
@@ -79,44 +88,159 @@ class ServerMonitor: ObservableObject {
                 // Exclude grep or our own app just in case
                 if cmd.contains("grep") || cmd.contains("LLMTracker") { continue }
                 
-                if serverKeywords.contains(where: { cmd.localizedCaseInsensitiveContains($0) }) {
-                    if let pid = Int32(pidStr), let ppid = Int32(ppidStr) {
-                        let name = determineServerName(from: cmd)
-                        let owningApp = determineOwningApp(ppid: ppid)
-                        let port = determinePort(for: pid)
-                        
-                        var loadedModels: [String] = []
-                        if name.lowercased().contains("ollama") {
-                            if let port = port {
-                                loadedModels = await fetchOllamaModels(port: port)
-                            }
-                        } else if name == "OMLX" {
-                            if let port = port {
-                                let omlxModels = await fetchOMLXStatus(port: port)
-                                if !omlxModels.isEmpty {
-                                    loadedModels = omlxModels
-                                } else if let extractedModel = extractModel(from: cmd) {
-                                    loadedModels = [extractedModel]
-                                } else {
-                                    loadedModels = ["Dynamic / Auto-loaded"]
-                                }
-                            }
-                        } else {
-                            if let extractedModel = extractModel(from: cmd) {
-                                loadedModels = [extractedModel]
-                            } else {
-                                loadedModels = ["Dynamic / Auto-loaded"]
-                            }
-                        }
-                        
-                        let instance = ServerInstance(pid: pid, name: name, port: port, loadedModels: loadedModels, owningApp: owningApp)
-                        foundInstances.append(instance)
+                if let pid = Int32(pidStr), let ppid = Int32(ppidStr) {
+                    processMap[pid] = ProcessInfo(pid: pid, ppid: ppid, command: cmd)
+                }
+            }
+        }
+        
+        // 2. Fetch all listening TCP ports using lsof in a single command execution
+        let lsofOutput = runCommand("lsof", args: ["-iTCP", "-sTCP:LISTEN", "-P", "-n"])
+        let lsofLines = lsofOutput.components(separatedBy: .newlines)
+        
+        var pidToPortMap: [Int32: Int] = [:]
+        for line in lsofLines {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty || trimmed.contains("COMMAND") { continue }
+            
+            if let parsed = parseLsofLine(trimmed) {
+                // If a process listens on multiple ports, prefer standard LLM/MLX ports or keep the first one
+                if pidToPortMap[parsed.pid] == nil {
+                    pidToPortMap[parsed.pid] = parsed.port
+                } else {
+                    let existingPort = pidToPortMap[parsed.pid]!
+                    let candidatePorts = [11434, 8000, 8080, 8081, 1234, 5001, 4242, 8082, 5413]
+                    if candidatePorts.contains(parsed.port) && !candidatePorts.contains(existingPort) {
+                        pidToPortMap[parsed.pid] = parsed.port
                     }
                 }
             }
         }
         
+        // 3. Define candidate filters for Swift apps and python sidecars
+        let candidateKeywords = [
+            "python", "node", "swift", "mlx", "omlx", "llama", "ollama", "vllm", 
+            "mflux", "server", "llm", "model", "inference", "sidecar", "uvicorn", 
+            "gunicorn", "fastapi", "app.py"
+        ]
+        let candidatePorts = [11434, 8000, 8080, 8081, 1234, 5001, 4242, 8082, 5413]
+        
+        // 4. Identify servers
+        for (_, proc) in processMap {
+            let cmd = proc.command
+            let pid = proc.pid
+            let ppid = proc.ppid
+            
+            // Check explicit keyword match
+            let isExplicitServer = serverKeywords.contains(where: { cmd.localizedCaseInsensitiveContains($0) })
+            
+            // Check if it's listening on a TCP port and is a potential candidate
+            let port = pidToPortMap[pid]
+            var isCandidate = false
+            if let port = port {
+                let containsKeyword = candidateKeywords.contains(where: { cmd.localizedCaseInsensitiveContains($0) })
+                let isLLMPort = candidatePorts.contains(port)
+                isCandidate = containsKeyword || isLLMPort
+            }
+            
+            if isExplicitServer || isCandidate {
+                let owningApp = determineOwningApp(ppid: ppid)
+                var name = determineServerName(from: cmd)
+                var loadedModels: [String] = []
+                var detected = false
+                
+                if let port = port {
+                    // Try to probe the port to see what kind of server it is and what models are loaded.
+                    // Keep timeouts very low (0.5s) to avoid UI blocking.
+                    
+                    // Probe OMLX status endpoint
+                    if let omlxModels = await fetchOMLXModels(port: port) {
+                        name = "OMLX"
+                        loadedModels = omlxModels.isEmpty ? ["Dynamic / Auto-loaded"] : omlxModels
+                        detected = true
+                    }
+                    
+                    // Probe Ollama status endpoints
+                    if !detected, let ollamaModels = await fetchOllamaModels(port: port) {
+                        name = "Ollama"
+                        loadedModels = ollamaModels.isEmpty ? ["Dynamic / Auto-loaded"] : ollamaModels
+                        detected = true
+                    }
+                    
+                    // Probe general OpenAI compatible (/v1/models) endpoint (vLLM, mlx-openai-server, llama.cpp, etc.)
+                    if !detected, let openAIModels = await fetchOpenAIModels(port: port) {
+                        if name == "Unknown Server" {
+                            if cmd.localizedCaseInsensitiveContains("vllm") {
+                                name = "vLLM"
+                            } else if cmd.localizedCaseInsensitiveContains("swift-mlx") || cmd.localizedCaseInsensitiveContains("mlx-swift") || cmd.localizedCaseInsensitiveContains("swiftlm") {
+                                name = "Swift-MLX"
+                            } else if cmd.localizedCaseInsensitiveContains("mlx") {
+                                if cmd.localizedCaseInsensitiveContains("swift") {
+                                    name = "Swift-MLX"
+                                } else {
+                                    name = "MLX-LM"
+                                }
+                            } else if cmd.localizedCaseInsensitiveContains("omlx") {
+                                name = "OMLX"
+                            } else if cmd.localizedCaseInsensitiveContains("mflux") {
+                                name = "MFlux"
+                            } else {
+                                name = "MLX/OpenAI Server"
+                            }
+                        }
+                        loadedModels = openAIModels.isEmpty ? ["Dynamic / Auto-loaded"] : openAIModels
+                        detected = true
+                    }
+                }
+                
+                // If it's a known explicit server but no active network probe succeeded, fallback to command line extraction
+                if !detected && isExplicitServer {
+                    if name == "Unknown Server" {
+                        name = determineServerName(from: cmd)
+                    }
+                    if let extractedModel = extractModel(from: cmd) {
+                        loadedModels = [extractedModel]
+                    } else {
+                        loadedModels = ["Dynamic / Auto-loaded"]
+                    }
+                    detected = true
+                }
+                
+                if detected {
+                    let instance = ServerInstance(
+                        pid: pid,
+                        name: name,
+                        port: port,
+                        loadedModels: loadedModels,
+                        owningApp: owningApp
+                    )
+                    foundInstances.append(instance)
+                }
+            }
+        }
+        
         return foundInstances
+    }
+    
+    private func parseLsofLine(_ line: String) -> (pid: Int32, port: Int)? {
+        let parts = line.split(separator: " ", omittingEmptySubsequences: true)
+        guard parts.count >= 9 else { return nil }
+        
+        let pidStr = String(parts[1])
+        guard let pid = Int32(pidStr) else { return nil }
+        
+        for part in parts {
+            if part.contains(":") {
+                let components = part.split(separator: ":")
+                if let portStrWithListen = components.last {
+                    let portStr = portStrWithListen.replacingOccurrences(of: "(LISTEN)", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+                    if let port = Int(portStr) {
+                        return (pid, port)
+                    }
+                }
+            }
+        }
+        return nil
     }
     
     private func determineServerName(from cmd: String) -> String {
@@ -126,6 +250,7 @@ class ServerMonitor: ObservableObject {
                 if keyword == "vllm" { return "vLLM" }
                 if keyword == "mlx_lm" || keyword == "mlx-lm" { return "MLX-LM" }
                 if keyword == "omlx" { return "OMLX" }
+                if keyword == "swift-mlx" || keyword == "mlx-swift" || keyword == "mlx-swift-lm" || keyword == "swiftlm" { return "Swift-MLX" }
                 return keyword
             }
         }
@@ -146,26 +271,6 @@ class ServerMonitor: ObservableObject {
         return nil
     }
     
-    private func determinePort(for pid: Int32) -> Int? {
-        let output = runCommand("lsof", args: ["-iTCP", "-sTCP:LISTEN", "-P", "-n", "-a", "-p", "\(pid)"])
-        let lines = output.components(separatedBy: .newlines)
-        for line in lines {
-            if line.contains("LISTEN") {
-                let parts = line.split(separator: " ", omittingEmptySubsequences: true)
-                // usually column 8 is the port binding e.g., *:11434 or localhost:8080 or 127.0.0.1:8000
-                for part in parts {
-                    if part.contains(":") {
-                        let components = part.split(separator: ":")
-                        if let portStr = components.last, let port = Int(portStr) {
-                            return port
-                        }
-                    }
-                }
-            }
-        }
-        return nil
-    }
-    
     private func extractModel(from cmd: String) -> String? {
         let parts = cmd.components(separatedBy: .whitespaces)
         for (index, part) in parts.enumerated() {
@@ -178,29 +283,73 @@ class ServerMonitor: ObservableObject {
         return nil
     }
     
-    private func fetchOllamaModels(port: Int) async -> [String] {
-        guard let url = URL(string: "http://127.0.0.1:\(port)/api/ps") else { return [] }
+    private func fetchOllamaModels(port: Int) async -> [String]? {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/api/ps") else { return nil }
         var request = URLRequest(url: url)
-        request.timeoutInterval = 2.0
+        request.timeoutInterval = 0.5
         do {
-            let (data, _) = try await URLSession.shared.data(for: request)
-            let response = try JSONDecoder().decode(OllamaPSResponse.self, from: data)
-            return response.models.map { $0.name }
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+                return nil
+            }
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            guard json?["models"] != nil else {
+                // Try /api/tags as fallback
+                if let fallbackUrl = URL(string: "http://127.0.0.1:\(port)/api/tags") {
+                    var fallbackReq = URLRequest(url: fallbackUrl)
+                    fallbackReq.timeoutInterval = 0.5
+                    if let (fallbackData, fallbackResponse) = try? await URLSession.shared.data(for: fallbackReq),
+                       let fallbackHttp = fallbackResponse as? HTTPURLResponse, fallbackHttp.statusCode == 200,
+                       let fallbackJson = try? JSONSerialization.jsonObject(with: fallbackData) as? [String: Any],
+                       fallbackJson["models"] != nil,
+                       let decoded = try? JSONDecoder().decode(OllamaPSResponse.self, from: fallbackData) {
+                        return decoded.models.map { $0.name }
+                    }
+                }
+                return nil
+            }
+            let decoded = try JSONDecoder().decode(OllamaPSResponse.self, from: data)
+            return decoded.models.map { $0.name }
         } catch {
-            return []
+            return nil
         }
     }
     
-    private func fetchOMLXStatus(port: Int) async -> [String] {
-        guard let url = URL(string: "http://127.0.0.1:\(port)/api/status") else { return [] }
+    private func fetchOMLXModels(port: Int) async -> [String]? {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/api/status") else { return nil }
         var request = URLRequest(url: url)
-        request.timeoutInterval = 2.0
+        request.timeoutInterval = 0.5
         do {
-            let (data, _) = try await URLSession.shared.data(for: request)
-            let response = try JSONDecoder().decode(OMLXStatusResponse.self, from: data)
-            return response.loaded_models ?? []
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+                return nil
+            }
+            let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+            guard json?["loaded_models"] != nil else { return nil }
+            
+            let decoded = try JSONDecoder().decode(OMLXStatusResponse.self, from: data)
+            return decoded.loaded_models ?? []
         } catch {
-            return []
+            return nil
+        }
+    }
+    
+    private func fetchOpenAIModels(port: Int) async -> [String]? {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/v1/models") else { return nil }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 0.5
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+                return nil
+            }
+            let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+            guard json?["data"] != nil else { return nil }
+            
+            let decoded = try JSONDecoder().decode(OpenAIModelsResponse.self, from: data)
+            return decoded.data.map { $0.id }
+        } catch {
+            return nil
         }
     }
     
